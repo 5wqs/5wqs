@@ -39,34 +39,34 @@
 
 - **`IProcessNode`**：流程节点的抽象（通常是枚举或具备唯一标识的对象）。
 - **`NodeProcessor`**：节点处理器，负责执行节点逻辑。
-  - 关键方法：`boolean process(String processInstanceId, ProcessContext context)`
-  - 返回 `true` 表示节点完成，引擎将标记完成并推进后续节点。
+    - 关键方法：`boolean process(String processInstanceId, ProcessContext context)`
+    - 返回 `true` 表示节点完成，引擎将标记完成并推进后续节点。
 - **`ProcessContext`**：流程上下文，用于节点之间共享输入、输出、变量等。
 - **`ProcessInstanceState`**：流程实例状态，至少包含：
-  - `processInstanceId`
-  - `completedNodes`：已完成节点集合
-  - `markNodeCompleted(node)`、`isNodeCompleted(node)` 等。
+    - `processInstanceId`
+    - `completedNodes`：已完成节点集合
+    - `markNodeCompleted(node)`、`isNodeCompleted(node)` 等。
 
 ### 3.2 引擎内部状态
 
 引擎维护三个核心 Map + 一个锁缓存：
 
 - `processInstances: Map<String, ProcessInstanceState>`
-  - Key：`processInstanceId`
-  - Value：该实例的节点完成状态
+    - Key：`processInstanceId`
+    - Value：该实例的节点完成状态
 
 - `nodeProcessors: Map<IProcessNode, NodeProcessor>`
-  - Key：节点
-  - Value：节点处理器
+    - Key：节点
+    - Value：节点处理器
 
 - `nodeDependencies: Map<IProcessNode, Set<IProcessNode>>`
-  - Key：节点
-  - Value：该节点的前置节点集合（依赖）
+    - Key：节点
+    - Value：该节点的前置节点集合（依赖）
 
 - `LOCKS: Cache<String, Object>`（Caffeine cache）
-  - Key：`processInstanceId`
-  - Value：用于 `synchronized` 的互斥锁对象
-  - 使用 `weakValues()`，避免锁对象长期强引用导致内存占用。
+    - Key：`processInstanceId`
+    - Value：用于 `synchronized` 的互斥锁对象
+    - 使用 `weakValues()`，避免锁对象长期强引用导致内存占用。
 
 ---
 
@@ -78,7 +78,7 @@
 flowchart LR
     Caller[调用方/业务方] -->|process(id, node, context)| Engine[WorkflowProcessEngine]
 
-    Engine -->|get| Locks[(LOCKS: Caffeine)]
+    Engine -->|get| Locks[(LOCKS Caffeine Cache)]
     Engine -->|computeIfAbsent| Instances[(processInstances)]
     Engine -->|lookup| Processors[(nodeProcessors)]
     Engine -->|lookup| Deps[(nodeDependencies)]
@@ -140,10 +140,12 @@ sequenceDiagram
 **作用**：注册节点处理器，并初始化该节点的依赖集合。
 
 **副作用**：
+
 - 覆盖已有处理器：`nodeProcessors.put(node, processor)`
 - 确保 `nodeDependencies` 有该节点的集合（为空集合）
 
 **建议**：
+
 - 引擎启动时一次性注册全量节点处理器。
 
 ### 5.2 `addDependency(IProcessNode node, IProcessNode prerequisite)`
@@ -151,9 +153,11 @@ sequenceDiagram
 **作用**：声明 `node` 依赖 `prerequisite`（即 `prerequisite -> node` 的边）。
 
 **环检测**：通过 `wouldCreateCycle(node, prerequisite)` 进行 DFS。
+
 - 如果发现从 `prerequisite` 出发能走到 `node`，则新增边会形成环，抛出 `BizRunTimeException(ErrorCode.SYSTEM_ERROR)`。
 
 **注意**：
+
 - `wouldCreateCycle(from, to)` 的命名容易读反：它实际检测“新增 `to -> from` 会不会有环”。
 
 ### 5.3 `process(String processInstanceId, IProcessNode currentNode, ProcessContext context)`
@@ -161,23 +165,27 @@ sequenceDiagram
 **入口方法**：执行当前节点，并在“完成”时推进后续节点。
 
 **并发控制**：
+
 - 对每个 `processInstanceId` 使用独立的 lock。
 - 在 `synchronized(lock)` 内完成：状态获取、节点执行、状态标记、后继推进。
 
 **节点处理器缺失**：
+
 - `nodeProcessors.get(currentNode)` 为 `null` 时仅记录日志并返回，不抛异常。
 
 ### 5.4 `checkAndExecuteNextNodes(...)`
 
 **推进逻辑**：
+
 - 若已完成节点数 == 已注册处理器数：认为流程完成，移除 `processInstances` 中该实例状态。
 - 遍历所有节点：
-  - 跳过已完成节点
-  - 跳过当前节点
-  - 仅当该节点 prerequisites 包含 `currentNode` 才继续（即“当前节点”是它的前置之一）
-  - 若已完成集合包含该节点全部 prerequisites：递归调用 `process` 执行它。
+    - 跳过已完成节点
+    - 跳过当前节点
+    - 仅当该节点 prerequisites 包含 `currentNode` 才继续（即“当前节点”是它的前置之一）
+    - 若已完成集合包含该节点全部 prerequisites：递归调用 `process` 执行它。
 
 **特性**：
+
 - 推进是“依赖触发”的：只有当某个节点完成后才尝试推进依赖它的节点。
 
 ---
@@ -210,14 +218,15 @@ sequenceDiagram
 ### 7.1 流程实例状态
 
 - 当完成节点数与注册节点数一致时，引擎执行：
-  - `processInstances.remove(processInstanceId)`
+    - `processInstances.remove(processInstanceId)`
 
 ### 7.2 锁对象（LOCKS）
 
 - `weakValues()`：锁对象仅被 cache 弱引用持有。
 - 仍需注意：如果业务侧持有 `processInstanceId` 并重复触发，锁对象可能被回收后重建（这通常没问题，但会改变锁对象身份）。
 
-> 备注：`weakKeys()` 未开启，因此 key（String）是强引用；不过 key 的生命周期由 cache 内部管理。若担心实例 id 无限增长，可考虑配置 `expireAfterAccess`。
+> 备注：`weakKeys()` 未开启，因此 key（String）是强引用；不过 key 的生命周期由 cache 内部管理。若担心实例 id 无限增长，可考虑配置
+`expireAfterAccess`。
 
 ---
 
@@ -225,9 +234,11 @@ sequenceDiagram
 
 - 添加依赖形成环：抛出 `BizRunTimeException(ErrorCode.SYSTEM_ERROR)`。
 - 缺少节点处理器：记录 error 日志并返回。
-- 节点处理器内部异常：当前引擎未捕获；若 `processor.process(...)` 抛异常，将直接向上抛出并中断该次推进（同时仍处于 synchronized 区域内抛出）。
+- 节点处理器内部异常：当前引擎未捕获；若 `processor.process(...)` 抛异常，将直接向上抛出并中断该次推进（同时仍处于
+  synchronized 区域内抛出）。
 
 建议：
+
 - 在 `process` 中对 `processor.process` 增加 try/catch，区分可重试/不可重试。
 - 增加流程实例级的 metrics（完成耗时、节点耗时、失败数等）。
 
@@ -238,14 +249,17 @@ sequenceDiagram
 > 仅展示典型用法，具体节点枚举/实现以你的工程为准。
 
 1) 定义节点：
+
 - `NodeA`, `NodeB`, `NodeC`, `NodeD`
 
 2) 注册处理器并配置依赖：
+
 - `B` 依赖 `A`
 - `C` 依赖 `A`
 - `D` 依赖 `B`、`C`
 
 3) 触发执行：
+
 - `engine.process(instanceId, NodeA, ctx)`
 - A 完成后会自动推进 B、C；当 B 与 C 都完成后自动推进 D。
 
@@ -253,9 +267,11 @@ sequenceDiagram
 
 ## 10. 边界情况与注意事项
 
-- **未注册依赖集**：`registerProcessor` 会为节点初始化依赖集合；但如果先 `addDependency` 再注册也能工作（`computeIfAbsent` 也会初始化）。
+- **未注册依赖集**：`registerProcessor` 会为节点初始化依赖集合；但如果先 `addDependency` 再注册也能工作（`computeIfAbsent`
+  也会初始化）。
 - **依赖未注册节点**：引擎允许给未注册的节点添加依赖关系，但推进时仅遍历 `nodeProcessors.keySet()`，未注册处理器的节点永远不会被执行。
-- **节点标识稳定性**：`nodeProcessors` 与 `nodeDependencies` 的 key 都是 `IProcessNode`。若 `IProcessNode` 是普通对象，需确保实现了稳定的 `equals/hashCode`，否则 Map/Set 行为不可预期。理想选择：enum。
+- **节点标识稳定性**：`nodeProcessors` 与 `nodeDependencies` 的 key 都是 `IProcessNode`。若 `IProcessNode` 是普通对象，需确保实现了稳定的
+  `equals/hashCode`，否则 Map/Set 行为不可预期。理想选择：enum。
 - **完成定义**：节点是否完成由 `NodeProcessor.process` 的返回值决定；返回 `false` 会导致引擎不推进后续节点。
 
 ---
@@ -266,9 +282,9 @@ sequenceDiagram
 2. **避免递归**：用队列/拓扑推进的方式替代递归，减少深链路栈风险。
 3. **提供启动节点/自动寻找起点**：增加 `start(processInstanceId, context)`，自动找入度为 0 的节点作为起点。
 4. **补充异常策略**：
-   - catch 处理器异常并记录失败节点
-   - 可选重试
-   - 失败终止/失败继续（策略化）
+    - catch 处理器异常并记录失败节点
+    - 可选重试
+    - 失败终止/失败继续（策略化）
 5. **增加可视化**：提供导出 DAG 的方法（输出 Mermaid/GraphViz）。
 
 ---
@@ -276,5 +292,3 @@ sequenceDiagram
 ## 12. 相关源码
 
 - `src/main/java/com/ddm/promotion/common/design/workflowprocess/WorkflowProcessEngine.java`
-
-
