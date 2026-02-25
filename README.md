@@ -1,169 +1,280 @@
-# 工作流流程引擎技术文档
+# WorkflowProcessEngine 技术文档
 
-## 1. 概述
+> 适用范围：`com.ddm.promotion.common.design.workflowprocess.WorkflowProcessEngine`
 
-工作流流程引擎（`WorkflowProcessEngine`）是一个轻量级的**内存级流程驱动组件**，用于管理和驱动具有前置依赖关系的节点任务。它基于有向无环图（DAG）模型，支持节点注册、依赖注入、状态追踪以及自动触发后续节点。该引擎适用于非持久化、低并发、短生命周期的流程场景（如一次性批处理、测试环境模拟等）。
+## 1. 背景与定位
 
-> ⚠️ **重要提示**：引擎状态完全驻留在内存中，**不支持持久化**，且未引入分布式锁，因此**不适合高并发、长周期或关键业务场景**。
+`WorkflowProcessEngine` 是一个**内存级**、**轻量**的流程编排引擎，用于在同一进程内按依赖关系驱动多个 `IProcessNode` 的执行。
 
-## 2. 架构设计
+- 通过 `registerProcessor` 注册“节点 -> 处理器”的映射。
+- 通过 `addDependency` 声明节点依赖关系（前置节点）。
+- 通过 `process(processInstanceId, currentNode, context)` 触发某个流程实例在某个节点上的执行，并在节点完成后自动推进满足依赖的后续节点。
 
-### 2.1 整体架构图
+> 源码注释提示：这是“内存级别”的引擎，**触发时间间隔较短的勿用**。它不提供跨进程持久化、延迟队列、定时调度、故障恢复等能力。
+
+---
+
+## 2. 目标与非目标
+
+### 2.1 目标
+
+- **依赖驱动**：根据 DAG（有向无环图）依赖关系推进节点执行。
+- **流程实例隔离**：每个 `processInstanceId` 独立维护节点完成状态。
+- **并发保护**：同一 `processInstanceId` 的推进过程串行化，避免并发推进导致的状态竞争。
+- **循环依赖保护**：在添加依赖关系时进行环检测，拒绝引入环。
+
+### 2.2 非目标
+
+- 不保证分布式一致性（没有数据库/消息队列参与）。
+- 不提供持久化与恢复（JVM 重启会丢失运行态）。
+- 不提供线程池/异步调度（当前实现采用同步递归推进）。
+
+---
+
+## 3. 核心概念与数据结构
+
+### 3.1 关键接口/类（根据引擎使用方式推断）
+
+> 以下接口/类在仓库中应存在：
+
+- **`IProcessNode`**：流程节点的抽象（通常是枚举或具备唯一标识的对象）。
+- **`NodeProcessor`**：节点处理器，负责执行节点逻辑。
+  - 关键方法：`boolean process(String processInstanceId, ProcessContext context)`
+  - 返回 `true` 表示节点完成，引擎将标记完成并推进后续节点。
+- **`ProcessContext`**：流程上下文，用于节点之间共享输入、输出、变量等。
+- **`ProcessInstanceState`**：流程实例状态，至少包含：
+  - `processInstanceId`
+  - `completedNodes`：已完成节点集合
+  - `markNodeCompleted(node)`、`isNodeCompleted(node)` 等。
+
+### 3.2 引擎内部状态
+
+引擎维护三个核心 Map + 一个锁缓存：
+
+- `processInstances: Map<String, ProcessInstanceState>`
+  - Key：`processInstanceId`
+  - Value：该实例的节点完成状态
+
+- `nodeProcessors: Map<IProcessNode, NodeProcessor>`
+  - Key：节点
+  - Value：节点处理器
+
+- `nodeDependencies: Map<IProcessNode, Set<IProcessNode>>`
+  - Key：节点
+  - Value：该节点的前置节点集合（依赖）
+
+- `LOCKS: Cache<String, Object>`（Caffeine cache）
+  - Key：`processInstanceId`
+  - Value：用于 `synchronized` 的互斥锁对象
+  - 使用 `weakValues()`，避免锁对象长期强引用导致内存占用。
+
+---
+
+## 4. 架构与流程
+
+### 4.1 总体架构图
 
 ```mermaid
-graph TD
-    A[外部调用] --> B{WorkflowProcessEngine}
-    B --> C[注册节点处理器<br/>nodeProcessors]
-    B --> D[维护依赖关系<br/>nodeDependencies]
-    B --> E[流程实例状态缓存<br/>processInstances]
-    B --> F[分布式锁缓存<br/>LOCKS（Caffeine）]
-    
-    C --> G[NodeProcessor]
-    D --> H[Set<IProcessNode> 前置节点]
-    E --> I[ProcessInstanceState]
-    I --> J[completedNodes]
-    
-    subgraph 处理流程
-        K[process(instanceId, currentNode, context)] --> L[获取/创建实例状态]
-        L --> M[执行NodeProcessor]
-        M --> N{是否完成?}
-        N -->|是| O[标记节点完成]
-        O --> P[遍历所有节点]
-        P --> Q{依赖满足?}
-        Q -->|是| K
+flowchart LR
+    Caller[调用方/业务方] -->|process(id, node, context)| Engine[WorkflowProcessEngine]
+
+    Engine -->|get| Locks[(LOCKS: Caffeine)]
+    Engine -->|computeIfAbsent| Instances[(processInstances)]
+    Engine -->|lookup| Processors[(nodeProcessors)]
+    Engine -->|lookup| Deps[(nodeDependencies)]
+
+    Engine -->|processor.process(...)| Processor[NodeProcessor]
+    Processor -->|读写| Ctx[ProcessContext]
+
+    Engine -->|mark completed| State[ProcessInstanceState]
+    State --> Completed[(completedNodes)]
+```
+
+### 4.2 依赖关系图（DAG）示意
+
+```mermaid
+flowchart TD
+    A[Node A] --> B[Node B]
+    A --> C[Node C]
+    B --> D[Node D]
+    C --> D
+
+    %% 含义：D 依赖 B + C；B/C 依赖 A
+```
+
+### 4.3 执行时序图（节点完成后推进后继）
+
+```mermaid
+sequenceDiagram
+    participant Caller as 调用方
+    participant Engine as WorkflowProcessEngine
+    participant Locks as LOCKS
+    participant State as ProcessInstanceState
+    participant Proc as NodeProcessor
+
+    Caller->>Engine: process(instanceId, currentNode, context)
+    Engine->>Locks: lock = get(instanceId)
+    Engine->>Engine: synchronized(lock)
+    Engine->>State: computeIfAbsent(instanceId)
+    Engine->>Engine: processor = nodeProcessors.get(currentNode)
+    Engine->>Proc: processor.process(instanceId, context)
+    Proc-->>Engine: currentCompleted=true/false
+    alt currentCompleted == true
+        Engine->>State: markNodeCompleted(currentNode)
+        Engine->>Engine: checkAndExecuteNextNodes(...)
+        loop 遍历所有 nodeProcessors.keySet()
+            Engine->>Engine: 若 node 的 prerequisites 全部完成
+            Engine->>Engine: process(instanceId, nextNode, context) (递归)
+        end
+    else currentCompleted == false
+        Engine-->>Caller: 当前节点未完成，不推进后续
     end
 ```
 
-### 2.2 核心组件
+---
 
-| 组件 | 说明 |
-|------|------|
-| `WorkflowProcessEngine` | 流程引擎主类，提供注册、依赖添加、节点处理等核心方法 |
-| `IProcessNode` | 节点标识接口，通常由枚举实现，用于区分不同节点 |
-| `NodeProcessor` | 节点处理器接口，定义节点执行逻辑 |
-| `ProcessContext` | 流程上下文接口，用于传递流程共享数据 |
-| `ProcessInstanceState` | 流程实例状态类，记录某个实例下各节点的完成情况 |
-| `Caffeine Cache` | 用于存储流程级别锁对象，防止并发处理同一实例 |
+## 5. 关键方法说明
 
-## 3. 核心功能
+### 5.1 `registerProcessor(IProcessNode node, NodeProcessor processor)`
 
-### 3.1 节点注册与依赖管理
+**作用**：注册节点处理器，并初始化该节点的依赖集合。
 
-- **注册节点处理器**：将节点与其处理逻辑绑定。
-- **添加依赖关系**：指定某个节点依赖于一个或多个前置节点。引擎在添加依赖时会自动进行**循环依赖检测**，若发现环则拒绝添加并抛出异常。
+**副作用**：
+- 覆盖已有处理器：`nodeProcessors.put(node, processor)`
+- 确保 `nodeDependencies` 有该节点的集合（为空集合）
 
-### 3.2 流程驱动
+**建议**：
+- 引擎启动时一次性注册全量节点处理器。
 
-- 通过 `process(processInstanceId, currentNode, context)` 方法触发节点处理。
-- 每个流程实例拥有独立的状态（`ProcessInstanceState`），记录已完成的节点。
-- 节点执行成功后，引擎自动检查所有依赖该节点的后续节点，若其所有前置节点均已完成，则递归触发后续节点处理。
-- 当所有节点完成时，自动清理实例状态，释放内存。
+### 5.2 `addDependency(IProcessNode node, IProcessNode prerequisite)`
 
-### 3.3 并发控制
+**作用**：声明 `node` 依赖 `prerequisite`（即 `prerequisite -> node` 的边）。
 
-- 使用 `Caffeine` 缓存为每个流程实例生成一个锁对象（`LOCKS`），并通过 `synchronized` 块保证同一时刻只有一个线程在处理同一流程实例。
+**环检测**：通过 `wouldCreateCycle(node, prerequisite)` 进行 DFS。
+- 如果发现从 `prerequisite` 出发能走到 `node`，则新增边会形成环，抛出 `BizRunTimeException(ErrorCode.SYSTEM_ERROR)`。
 
-## 4. 工作流程详解
+**注意**：
+- `wouldCreateCycle(from, to)` 的命名容易读反：它实际检测“新增 `to -> from` 会不会有环”。
 
-1. **初始化引擎**：创建 `WorkflowProcessEngine` 实例。
-2. **注册节点及依赖**：
-   - 调用 `registerProcessor(node, processor)` 注册节点处理器。
-   - 调用 `addDependency(node, prerequisite)` 建立节点间的依赖关系。
-3. **外部触发**：调用 `process(instanceId, startNode, context)` 开始处理某个节点（通常为起始节点）。
-4. **节点执行**：
-   - 获取或创建实例状态。
-   - 根据 `currentNode` 查找对应的 `NodeProcessor` 并执行。
-   - 若处理器返回 `true`，标记该节点为已完成。
-5. **后续节点触发**：
-   - 遍历所有已注册节点，找出依赖当前节点的后续节点。
-   - 检查这些后续节点的所有前置节点是否均已完成，若满足则递归调用 `process` 处理该节点。
-6. **流程结束**：当所有节点完成时，从 `processInstances` 中移除该实例状态。
+### 5.3 `process(String processInstanceId, IProcessNode currentNode, ProcessContext context)`
 
-## 5. 使用指南
+**入口方法**：执行当前节点，并在“完成”时推进后续节点。
 
-### 5.1 定义节点枚举
+**并发控制**：
+- 对每个 `processInstanceId` 使用独立的 lock。
+- 在 `synchronized(lock)` 内完成：状态获取、节点执行、状态标记、后继推进。
 
-```java
-public enum DemoNode implements IProcessNode {
-    NODE_A,
-    NODE_B,
-    NODE_C
-}
-```
+**节点处理器缺失**：
+- `nodeProcessors.get(currentNode)` 为 `null` 时仅记录日志并返回，不抛异常。
 
-### 5.2 实现节点处理器
+### 5.4 `checkAndExecuteNextNodes(...)`
 
-```java
-public class DemoProcessor implements NodeProcessor {
-    private final DemoNode node;
-    
-    public DemoProcessor(DemoNode node) {
-        this.node = node;
-    }
-    
-    @Override
-    public boolean process(String processInstanceId, ProcessContext context) {
-        System.out.println("处理节点：" + node + "，实例：" + processInstanceId);
-        // 执行实际业务逻辑
-        return true; // 返回true表示节点成功完成
-    }
-}
-```
+**推进逻辑**：
+- 若已完成节点数 == 已注册处理器数：认为流程完成，移除 `processInstances` 中该实例状态。
+- 遍历所有节点：
+  - 跳过已完成节点
+  - 跳过当前节点
+  - 仅当该节点 prerequisites 包含 `currentNode` 才继续（即“当前节点”是它的前置之一）
+  - 若已完成集合包含该节点全部 prerequisites：递归调用 `process` 执行它。
 
-### 5.3 实现上下文
+**特性**：
+- 推进是“依赖触发”的：只有当某个节点完成后才尝试推进依赖它的节点。
 
-```java
-public class DemoContext implements ProcessContext {
-    // 自定义上下文数据
-    private Map<String, Object> data = new HashMap<>();
-    // getter/setter...
-}
-```
+---
 
-### 5.4 装配引擎并执行
+## 6. 线程安全与并发行为
 
-```java
-public class Demo {
-    public static void main(String[] args) {
-        WorkflowProcessEngine engine = new WorkflowProcessEngine();
-        
-        // 注册处理器
-        engine.registerProcessor(DemoNode.NODE_A, new DemoProcessor(DemoNode.NODE_A));
-        engine.registerProcessor(DemoNode.NODE_B, new DemoProcessor(DemoNode.NODE_B));
-        engine.registerProcessor(DemoNode.NODE_C, new DemoProcessor(DemoNode.NODE_C));
-        
-        // 建立依赖：B依赖于A，C依赖于B
-        engine.addDependency(DemoNode.NODE_B, DemoNode.NODE_A);
-        engine.addDependency(DemoNode.NODE_C, DemoNode.NODE_B);
-        
-        // 创建上下文
-        DemoContext context = new DemoContext();
-        
-        // 触发流程（从A开始）
-        engine.process("instance-001", DemoNode.NODE_A, context);
-        
-        // 输出：NODE_A -> NODE_B -> NODE_C 依次执行
-    }
-}
-```
+### 6.1 同一实例的串行化
 
-## 6. 注意事项
+- `LOCKS.get(processInstanceId, ...)` 为每个实例创建/获取锁对象。
+- `synchronized(lock)` 确保同一 `processInstanceId` 在同一时间只有一个推进线程进入关键区。
 
-1. **内存状态**：所有流程实例状态存储在 `ConcurrentHashMap` 中，应用重启后状态丢失。
-2. **不支持并发实例**：虽然通过锁控制了同一实例的并发，但若大量不同实例同时触发，引擎本身无容量限制，可能造成内存溢出。
-3. **节点处理器需幂等**：由于未提供重试或事务机制，处理器内部应保证幂等性，避免重复执行产生副作用。
-4. **避免长时间阻塞**：节点处理器应快速返回，若需耗时操作建议异步处理，否则会阻塞锁并影响后续节点。
-5. **循环依赖检测**：添加依赖时即时校验，但仅限于当前已存在的依赖关系，不保证后续修改的安全性。
-6. **适用场景**：仅适用于低频、非关键、可容忍状态丢失的流程，如单元测试、简单批处理、临时任务编排。
+### 6.2 不同实例可并行
 
-## 7. 扩展性讨论
+不同的 `processInstanceId` 将使用不同的 lock 对象，因此可以并行推进。
 
-- **持久化支持**：可将 `ProcessInstanceState` 持久化到数据库，并在引擎启动时恢复，但需配合分布式锁。
-- **异步执行**：当前为同步递归调用，可改造为线程池异步触发，提高吞吐量。
-- **事件监听**：可引入节点完成事件，便于外部监听和日志记录。
-- **超时与重试**：可增加节点执行超时控制和失败重试机制。
+### 6.3 递归推进与重入
 
-## 8. 总结
+- `checkAndExecuteNextNodes` 内部会调用 `process`，造成递归。
+- Java 的 `synchronized` 是可重入锁，同一线程重入不会死锁。
 
-`WorkflowProcessEngine` 提供了一个简洁的基于内存的流程驱动解决方案，核心思想是利用 DAG 模型自动触发后续节点。其代码清晰、易于理解，适合小型项目或作为学习工作流引擎的入门示例。使用时务必注意其内存特性及适用范围，避免在生产高并发场景下直接使用。
-```
+### 6.4 潜在风险
+
+- **深度递归**：节点链路很长时可能导致栈深过大。
+- **同步执行**：节点处理器若耗时，会阻塞同一实例后续推进。
+
+---
+
+## 7. 生命周期与内存回收
+
+### 7.1 流程实例状态
+
+- 当完成节点数与注册节点数一致时，引擎执行：
+  - `processInstances.remove(processInstanceId)`
+
+### 7.2 锁对象（LOCKS）
+
+- `weakValues()`：锁对象仅被 cache 弱引用持有。
+- 仍需注意：如果业务侧持有 `processInstanceId` 并重复触发，锁对象可能被回收后重建（这通常没问题，但会改变锁对象身份）。
+
+> 备注：`weakKeys()` 未开启，因此 key（String）是强引用；不过 key 的生命周期由 cache 内部管理。若担心实例 id 无限增长，可考虑配置 `expireAfterAccess`。
+
+---
+
+## 8. 异常处理与可观测性
+
+- 添加依赖形成环：抛出 `BizRunTimeException(ErrorCode.SYSTEM_ERROR)`。
+- 缺少节点处理器：记录 error 日志并返回。
+- 节点处理器内部异常：当前引擎未捕获；若 `processor.process(...)` 抛异常，将直接向上抛出并中断该次推进（同时仍处于 synchronized 区域内抛出）。
+
+建议：
+- 在 `process` 中对 `processor.process` 增加 try/catch，区分可重试/不可重试。
+- 增加流程实例级的 metrics（完成耗时、节点耗时、失败数等）。
+
+---
+
+## 9. 使用示例（伪代码）
+
+> 仅展示典型用法，具体节点枚举/实现以你的工程为准。
+
+1) 定义节点：
+- `NodeA`, `NodeB`, `NodeC`, `NodeD`
+
+2) 注册处理器并配置依赖：
+- `B` 依赖 `A`
+- `C` 依赖 `A`
+- `D` 依赖 `B`、`C`
+
+3) 触发执行：
+- `engine.process(instanceId, NodeA, ctx)`
+- A 完成后会自动推进 B、C；当 B 与 C 都完成后自动推进 D。
+
+---
+
+## 10. 边界情况与注意事项
+
+- **未注册依赖集**：`registerProcessor` 会为节点初始化依赖集合；但如果先 `addDependency` 再注册也能工作（`computeIfAbsent` 也会初始化）。
+- **依赖未注册节点**：引擎允许给未注册的节点添加依赖关系，但推进时仅遍历 `nodeProcessors.keySet()`，未注册处理器的节点永远不会被执行。
+- **节点标识稳定性**：`nodeProcessors` 与 `nodeDependencies` 的 key 都是 `IProcessNode`。若 `IProcessNode` 是普通对象，需确保实现了稳定的 `equals/hashCode`，否则 Map/Set 行为不可预期。理想选择：enum。
+- **完成定义**：节点是否完成由 `NodeProcessor.process` 的返回值决定；返回 `false` 会导致引擎不推进后续节点。
+
+---
+
+## 11. 可选改进建议（低风险）
+
+1. **加上锁过期策略**：例如 `expireAfterAccess(10, TimeUnit.MINUTES)`，避免实例 id 长期增长时 cache 膨胀。
+2. **避免递归**：用队列/拓扑推进的方式替代递归，减少深链路栈风险。
+3. **提供启动节点/自动寻找起点**：增加 `start(processInstanceId, context)`，自动找入度为 0 的节点作为起点。
+4. **补充异常策略**：
+   - catch 处理器异常并记录失败节点
+   - 可选重试
+   - 失败终止/失败继续（策略化）
+5. **增加可视化**：提供导出 DAG 的方法（输出 Mermaid/GraphViz）。
+
+---
+
+## 12. 相关源码
+
+- `src/main/java/com/ddm/promotion/common/design/workflowprocess/WorkflowProcessEngine.java`
+
+
